@@ -85,7 +85,7 @@ class Trainer:
             logger (Logger, optional): A logger object for logging. Defaults to None.
             writer (SummaryWriter, optional): A SummaryWriter object for logging. Defaults to None.
             stopper (EarlyStopping, optional): An EarlyStopping object for early stopping. Defaults to None.
-            local_rank (int, optional): The local rank for DDP training. Defaults to None.
+            local_rank (int, optional): The local rank for DDP training. Defaults to None. If use single gpu, make sure you set it to zero.
         """
         self.local_rank = local_rank
         self.cfg = cfg

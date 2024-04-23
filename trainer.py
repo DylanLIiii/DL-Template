@@ -33,7 +33,8 @@ except ImportError as e:
     print(f"An error occurred: {e}")
     print("Please install the 'wandb' package using 'pip install wandb'")
     print("If you don't want to use wandb, set 'use_wandb' to False in your trainer configuration file. Then will use tensorboard instead.")
-    
+
+#SECTION - Trainer Class
 class Trainer:
     """
     A class for training a model using PyTorch.
@@ -77,7 +78,7 @@ class Trainer:
             Trains the model for the specified number of epochs.
     """
     
-    def __init__(self, cfg, model, dataset, optimizer=None, criterion=None, scheduler=None, logger=None, writer=None, local_rank=None):
+    def __init__(self, cfg, model, dataset, optimizer=None, criterion=None, scheduler=None, logger=None, writer=None, stopper=None, local_rank=None):
         """
         Initializes the Trainer class with the given configuration, model, and data loaders.
 
@@ -94,7 +95,8 @@ class Trainer:
         self.local_rank = local_rank
         self.cfg = cfg
         self.logger = logger
-        self.is_gpu, self.is_multiple_gpu = check_gpu_status(cfg)
+        self.stopper = stopper
+        self.is_gpu, self.is_multiple_gpu = check_gpu_status(cfg, self.logger)
 
         # Make sure device_ids is a string like 0,1,2
         self.logger.info(f"GPU: {self.is_gpu}, Multiple GPUs: {self.is_multiple_gpu}, Device: cuda:{self.cfg.device_ids}")
@@ -122,8 +124,6 @@ class Trainer:
         self.start_epoch = 1
         
         self.logger.info(f"Start epoch: {self.start_epoch}")
-        self.best_acc = 0.0
-        self.early_stop_counter = 0
 
         self.scaler = torch.cuda.amp.GradScaler() if self.cfg.amp is not None else None
         self.logger.info(f"AMP: {self.cfg.amp}")
@@ -143,7 +143,7 @@ class Trainer:
             self.model = model
             self.model = self.model.to(self.device)
             self.model = nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-            self.model = DDP(self.model, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True)
+            self.model = DDP(self.model, device_ids=[self.local_rank], output_device=self.local_rank)#find_unused_parameters=True#
         else:
             self.model = model
             self.model = model.to(self.device)
@@ -261,8 +261,7 @@ class Trainer:
         self.model.eval()
         # if use DDP. make sure use tensor on the same device 
         # create on device instead of creating on cpu then move to target device like .cuda()
-        total_loss = torch.tensor(0.0, device=self.device)
-        total_correct = torch.tensor(0, device=self.device)
+        total_loss = 0.0
 
         with torch.no_grad():
             for data, target in self.test_loader:
@@ -271,30 +270,10 @@ class Trainer:
                 loss = self.criterion(output, target)
                 pred = output.argmax(dim=1)
                 total_loss += loss.item()
-                total_correct += pred.eq(target).sum().item()
         #reduce all data from multi-process into a single process
         avg_loss = total_loss / len(self.test_loader)
-        avg_accuracy = total_correct / len(self.test_loader.dataset)
             
-        return avg_loss, avg_accuracy
-
-    def save_best_model(self, epoch, best_acc):
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "best_acc": best_acc,
-        }
-        checkpoint_path = os.path.join(
-            self.cfg.checkpoint_dir, f"{self.cfg.model_name}_best_model.pth"
-        )
-        # check if it exits
-        if not os.path.exists(self.cfg.checkpoint_dir):
-            os.mkdir(self.cfg.checkpoint_dir)
-        if self.local_rank == 0:
-            torch.save(checkpoint, checkpoint_path)
-            self.logger.info(f"Best model saved to {checkpoint_path}")
+        return avg_loss
 
     def resume(self, checkpoint_path=None):
         """
@@ -326,19 +305,24 @@ class Trainer:
         self.logger.info(
             f"Resuming training from epoch {self.start_epoch} with best accuracy {self.best_acc:.2f}"
         )
-
-    def early_stop(self, test_acc):
-        if test_acc > self.best_acc:
-            self.best_acc = test_acc
-            self.early_stop_counter = 0
-        else:
-            self.early_stop_counter += 1
-            if self.early_stop_counter >= self.cfg.early_stop_patience:
-                self.logger.info(
-                    f"Early stopping triggered. Best accuracy: {self.best_acc:.2f}"
-                )
-                return True
-        return False
+    def save_best_model(self, epoch, best_acc):
+        if self.local_rank == 0:
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "best_acc": best_acc,
+            }
+            checkpoint_path = os.path.join(
+                self.cfg.checkpoint_dir, f"{self.cfg.model_name}_best_model.pth"
+            )
+            # check if it exits
+            if not os.path.exists(self.cfg.checkpoint_dir):
+                os.mkdir(self.cfg.checkpoint_dir)
+            if self.local_rank == 0:
+                torch.save(checkpoint, checkpoint_path)
+                self.logger.info(f"Best model saved to {checkpoint_path}")
     
     def cleanup(self):
         if self.is_multiple_gpu:
@@ -350,19 +334,61 @@ class Trainer:
         for epoch in range(self.start_epoch, self.cfg.epochs + 1):
             train_loss = self.train_one_epoch(epoch)
             self.scheduler.step()
-            test_loss, test_acc = self.test_one_epoch()
-
+            test_loss = self.test_one_epoch()
+            
+            if self.local_rank == 0:
+               self.stopper(test_loss)
+            
+            self.stopper.check_stop()
+            
+            # for logging, should reduce all into 0 local rank 
+            dist.reduce(torch.tensor(train_loss, device=self.device), 0, op=dist.ReduceOp.SUM)
+            dist.reduce(torch.tensor(test_loss, device=self.device), 0, op=dist.ReduceOp.SUM)
+            
             self.logger.info(
-                f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.2f}"
+                f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}"
             )
+            if self.stopper.is_best_now():
+                self.save_best_model(epoch, test_loss)
+            
+            if self.stopper.early_stop:
+                self.logger.info("Early stopping")
+                break
 
-            if test_acc > self.best_acc:
-                self.save_best_model(epoch, test_acc)
-
-            if self.early_stop(test_acc):
-                pass
         self.cleanup()                
-        
+#!SECTION
+
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0, local_rank=None):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+        self.local_rank = local_rank
+
+    def __call__(self, val_loss):
+        if self.best_loss - val_loss > self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+    def check_stop(self):
+        stop = torch.tensor(int(self.early_stop), dtype=torch.int, device='cuda')
+        dist.all_reduce(stop, op=dist.ReduceOp.MAX)
+        self.early_stop = bool(stop.item() > 0)
+        if self.local_rank == 0:
+            print(f"Early stop flag after synchronization: {self.early_stop}")
+            
+    def is_best_now(self):
+        if self.counter == 0:
+            return True
+        else:
+            return False
+            
 #SECTION - Test Trainer Code            
 class SyntheticDataset(Dataset):
     def __init__(self, num_samples, input_dim, num_classes):
@@ -382,7 +408,6 @@ class SyntheticDataset(Dataset):
     
 def test_trainer_function(local_rank):
     # test trainer 
-    print(f'{"-"*10} test Trainer {"-"*10}')
     @dataclass
     class Config:
         amp: bool = True
@@ -391,11 +416,11 @@ def test_trainer_function(local_rank):
         weight_decay: float = 0.0
         optimizer: str = 'adam'
         lr_decay: str = 'cosine'
-        epochs: int = 10
+        epochs: int = 50
         device_ids = [0, 1, 2, 3]
         checkpoint_dir: str = 'checkpoints'
         model_name: str = 'test_model'
-        early_stop_patience: int = 3
+        early_stop_patience: int = 1
         single_gpu: bool = False
         checkpoint_dir: str = 'checkpoints'
         batch_size: int = 32
@@ -409,7 +434,8 @@ def test_trainer_function(local_rank):
 
     # Instantiate the Trainer with the model, data loaders, and configuration
     logger = DistributedLogger(name="Trainer", local_rank=local_rank)
-    trainer = Trainer(cfg=cfg, model=model, dataset=(train_dataset, test_dataset), local_rank=local_rank, logger=logger)
+    stopper = EarlyStopping(patience=cfg.early_stop_patience, local_rank=local_rank)
+    trainer = Trainer(cfg=cfg, model=model, dataset=(train_dataset, test_dataset), local_rank=local_rank, logger=logger, stopper=stopper)
 
     # Run the training
     trainer.train()

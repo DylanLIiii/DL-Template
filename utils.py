@@ -107,8 +107,6 @@ class DistributedLogger(logging.Logger):
     def debug(self, msg, *args, **kwargs):
         if self.local_rank == 0:
             super().debug(msg, *args, **kwargs)
-    
-
 
 def check_gpu_status(cfg, logger=None):
     # TODO: add logger
@@ -124,20 +122,20 @@ def check_gpu_status(cfg, logger=None):
     - is_multi_gpu: A boolean indicating if multiple GPUs are available.
     """
     is_gpu, is_multi_gpu = False, False
-
+    outputer = logger.info if logger else print
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         if device_count > 1:
-            print(f"Number of GPUs: {device_count}")
+            outputer(f"Number of GPUs: {device_count}")
             is_multi_gpu = True
-        print(f"Device name: {torch.cuda.get_device_name(0)}")
+        outputer(f"Device name: {torch.cuda.get_device_name(0)}")
         is_gpu = True
     else:
-        print("GPU is not available")
+        outputer("GPU is not available")
 
     if cfg.single_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = cfg.device_ids[0]
-        print(f"Using GPU {cfg.device_ids[0]}")
+        outputer(f"Using GPU {cfg.device_ids[0]}")
         is_multi_gpu = False
 
     return is_gpu, is_multi_gpu

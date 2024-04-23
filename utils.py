@@ -70,14 +70,54 @@ def get_logger(name):
 
     print(f"Logger in {name}.py setup and usage completed successfully.")
     return logger
+    
+class DistributedLogger(logging.Logger):
+    def __init__(self, name: str, level=logging.NOTSET, local_rank=0) -> None:
+        super().__init__(name, level)
+        # Define the logging format and date format
+        log_format = "%(message)s"
+        date_format = "[%X]"
+        
+        self.local_rank = local_rank
+
+        # Setup handler with a specific format if this is the main process
+        if self.local_rank == 0:
+            # Initialize RichHandler with necessary settings
+            rich_handler = RichHandler()
+            rich_handler.setLevel(level)
+            formatter = logging.Formatter(log_format, datefmt=date_format)
+            rich_handler.setFormatter(formatter)
+            self.addHandler(rich_handler)
+        else:
+            # For non-main processes, set a higher log level or disable
+            self.setLevel(logging.WARNING)  # Adjust as necessary
+
+    def info(self, msg, *args, **kwargs):
+        if self.local_rank == 0:
+            super().info(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        if self.local_rank == 0:
+            super().warning(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        if self.local_rank == 0:
+            super().error(msg, *args, **kwargs)
+
+    def debug(self, msg, *args, **kwargs):
+        if self.local_rank == 0:
+            super().debug(msg, *args, **kwargs)
+    
 
 
-def check_gpu_status(cfg):
+def check_gpu_status(cfg, logger=None):
+    # TODO: add logger
     """
     Checks the GPU status and sets the environment variable for CUDA_VISIBLE_DEVICES if necessary.
 
     Parameters:
     - cfg: A configuration object that contains 'single_gpu' and 'device_id' attributes.
+    - logger: A logger object that can be used to log messages. Default is None.
 
     Returns:
     - is_gpu: A boolean indicating if a GPU is available.
@@ -101,3 +141,6 @@ def check_gpu_status(cfg):
         is_multi_gpu = False
 
     return is_gpu, is_multi_gpu
+
+if __name__ == "__main__":
+    pass

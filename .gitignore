@@ -1,2 +1,4 @@
 __pycache__
-checkpoints
+runs
+test_log_dir
+checkpoints/

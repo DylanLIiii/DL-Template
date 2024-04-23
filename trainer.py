@@ -37,7 +37,11 @@ except ImportError as e:
 #SECTION - Trainer Class
 class Trainer:
     """
-    A class for training a model using PyTorch.
+    A class for training a model using PyTorch, designed to support both single and distributed GPU training.
+
+    This class encapsulates the training process, including model initialization, loss function setup,
+    optimizer configuration, learning rate scheduling, and training loop management. It supports
+    training on single GPUs as well as multiple GPUs using Distributed Data Parallel (DDP).
 
     Attributes:
         cfg (dict): Configuration dictionary containing hyperparameters and settings.
@@ -53,29 +57,17 @@ class Trainer:
         early_stop_counter (int): A counter for early stopping mechanism.
         scaler (torch.cuda.amp.GradScaler): Gradient scaler for mixed precision training.
 
-    Methods:
-        __init__(self, cfg, model, Datasetloader, optimizer=None, criterion=None, scheduler=None):
-            Initializes the Trainer class with the given configuration, model, and data loaders.
-        _init_criterion(self):
-            Initializes the loss function based on the configuration.
-        _init_optimizer(self):
-            Initializes the optimizer based on the configuration.
-        _init_scheduler(self):
-            Initializes the learning rate scheduler based on the configuration.
-        train_one_step(self, data, target):
-            Performs one training step with the given data and target.
-        train_one_epoch(self, epoch):
-            Trains the model for one epoch.
-        test_one_epoch(self):
-            Tests the model for one epoch.
-        save_best_model(self, epoch, best_acc):
-            Saves the best model based on accuracy.
-        resume(self, checkpoint_path=None):
-            Resumes training from a checkpoint.
-        early_stop(self, test_acc):
-            Implements early stopping based on test accuracy.
-        train(self):
-            Trains the model for the specified number of epochs.
+    Example:
+        # Initialize the model, dataset, and configuration
+        model = MyModel()
+        dataset = MyDataset()
+        cfg = {...} # Configuration dictionary
+
+        # Create a Trainer instance
+        trainer = Trainer(cfg, model, dataset)
+
+        # Start training
+        trainer.train()
     """
     
     def __init__(self, cfg, model, dataset, optimizer=None, criterion=None, scheduler=None, logger=None, writer=None, stopper=None, local_rank=None):
@@ -85,17 +77,20 @@ class Trainer:
         Parameters:
             cfg (dict): Configuration dictionary containing hyperparameters and settings.
             model (nn.Module): The model to be trained. The model can not in device, it should be moved to device in this class.
-            dataloader (list): A list containing the training and testing DataLoader objects.
+            dataset (list): A list containing the training and testing DataLoader objects.
             optimizer (torch.optim.Optimizer, optional): The optimizer used for training. Defaults to None.
             criterion (torch.nn.Module, optional): The loss function used for training. Defaults to None.
             scheduler (torch.optim.lr_scheduler._LRScheduler, optional): The learning rate scheduler. Defaults to None.
+            logger (Logger, optional): A logger object for logging. Defaults to None.
             writer (SummaryWriter, optional): A SummaryWriter object for logging. Defaults to None.
-            #NOTE - For writer, generally we use tensorboard, can use wandb
+            stopper (EarlyStopping, optional): An EarlyStopping object for early stopping. Defaults to None.
+            local_rank (int, optional): The local rank for DDP training. Defaults to None.
         """
         self.local_rank = local_rank
         self.cfg = cfg
         self.logger = logger
         self.stopper = stopper
+        self.writer = writer
         self.is_gpu, self.is_multiple_gpu = check_gpu_status(cfg, self.logger)
 
         # Make sure device_ids is a string like 0,1,2
@@ -135,7 +130,10 @@ class Trainer:
     def _init_model(self, model):
         """
         Initializes the model based on the configuration.
-        
+
+        If multiple GPUs are available, the model is wrapped with DDP and moved to the appropriate device.
+        Otherwise, the model is simply moved to the device specified in the configuration.
+
         Parameters:
             model (nn.Module): The model to be trained.
         """
@@ -345,6 +343,9 @@ class Trainer:
             dist.reduce(torch.tensor(train_loss, device=self.device), 0, op=dist.ReduceOp.SUM)
             dist.reduce(torch.tensor(test_loss, device=self.device), 0, op=dist.ReduceOp.SUM)
             
+            self.writer.add_scalar('train_loss', train_loss, epoch)
+            self.writer.add_scalar('test_loss', test_loss, epoch)
+            
             self.logger.info(
                 f"Epoch {epoch} - Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}"
             )
@@ -435,16 +436,29 @@ def test_trainer_function(local_rank):
     # Instantiate the Trainer with the model, data loaders, and configuration
     logger = DistributedLogger(name="Trainer", local_rank=local_rank)
     stopper = EarlyStopping(patience=cfg.early_stop_patience, local_rank=local_rank)
-    trainer = Trainer(cfg=cfg, model=model, dataset=(train_dataset, test_dataset), local_rank=local_rank, logger=logger, stopper=stopper)
+    writer = DistrubutedWriter(log_dir="test_log_dir")
+    trainer = Trainer(cfg=cfg, model=model, dataset=(train_dataset, test_dataset), local_rank=local_rank, logger=logger, stopper=stopper, writer=writer)
 
     # Run the training
     trainer.train()
+    
+class DistrubutedWriter(SummaryWriter):
+    def __init__(self, log_dir='None', comment="", purge_step=None, max_queue=10, flush_secs=120, filename_suffix="", local_rank=0):
+        super().__init__(log_dir, comment, purge_step, max_queue, flush_secs, filename_suffix)
+        self.local_rank = local_rank
+    # Only override the add_scalar method. Because we use it here.
+    def add_scalar(self, tag, scalar_value, global_step=None, walltime=None):
+        if self.local_rank == 0:
+            super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime)
+    
     
 #!SECTION
 if __name__ == "__main__":
     import time
     time_start = time.time()
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+    #run = wandb.init(project='test', mode='offline')
+    writer = SummaryWriter()
     mp.spawn(test_trainer_function, nprocs=4)
     time_elapsed = time.time() - time_start
     print(f"\ntime elapsed: {time_elapsed:.2f} seconds")

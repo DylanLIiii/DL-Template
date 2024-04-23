@@ -6,6 +6,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from utils import check_gpu_status, get_logger, DistributedLogger
 from dataclasses import dataclass
+import glob
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -421,7 +422,7 @@ def test_trainer_function(local_rank):
         device_ids = [0, 1, 2, 3]
         checkpoint_dir: str = 'checkpoints'
         model_name: str = 'test_model'
-        early_stop_patience: int = 1
+        early_stop_patience: int = 5
         single_gpu: bool = False
         checkpoint_dir: str = 'checkpoints'
         batch_size: int = 32
@@ -436,30 +437,59 @@ def test_trainer_function(local_rank):
     # Instantiate the Trainer with the model, data loaders, and configuration
     logger = DistributedLogger(name="Trainer", local_rank=local_rank)
     stopper = EarlyStopping(patience=cfg.early_stop_patience, local_rank=local_rank)
-    writer = DistrubutedWriter(log_dir="test_log_dir")
+    # if you do not wanna use wandb, set mode = 'disabled'
+    writer = DistrubutedWriter(log_dir="test_log_dir", local_rank=local_rank)
     trainer = Trainer(cfg=cfg, model=model, dataset=(train_dataset, test_dataset), local_rank=local_rank, logger=logger, stopper=stopper, writer=writer)
 
     # Run the training
     trainer.train()
+    writer.close()
     
-class DistrubutedWriter(SummaryWriter):
+class DistrubutedWriter():
     def __init__(self, log_dir='None', comment="", purge_step=None, max_queue=10, flush_secs=120, filename_suffix="", local_rank=0):
-        super().__init__(log_dir, comment, purge_step, max_queue, flush_secs, filename_suffix)
+        self.log_dir = log_dir
+        self.comment = comment
         self.local_rank = local_rank
+        self._init_wandb(mode='online')
+        self._init_tensorboard()
+
     # Only override the add_scalar method. Because we use it here.
     def add_scalar(self, tag, scalar_value, global_step=None, walltime=None):
         if self.local_rank == 0:
-            super().add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime)
+            self.tensorboard_writer.add_scalar(tag, scalar_value, global_step=global_step, walltime=walltime)
+            if hasattr(self, 'wandb_run'): 
+                self.wandb_run.log({f'{tag}': scalar_value, 'step': global_step})
+
+            
+    def _init_wandb(self, mode):
+        # must call either wandb.init or wandb.tensorboard.patch before calling tf.summary.create_file_writer or constructing a SummaryWriter via torch.utils.tensorboard.SummaryWriter
+        # can accept a config parameter
+        if self.local_rank == 0:
+            wandb.tensorboard.patch(root_logdir=self.log_dir, pytorch=True)
+            self.wandb_run = wandb.init(project='test', mode=mode, sync_tensorboard=True)
     
+    def _init_tensorboard(self):
+        if self.local_rank == 0:
+            self.tensorboard_writer = SummaryWriter(log_dir=self.log_dir)
+    def close(self):
+        if hasattr(self, 'wandb_run'):
+            #wandb.save(glob.glob(f"{self.log_dir}/*.pt.trace.json")[0], base_path=f"{self.log_dir}")
+            wandb.finish()
+        self.tensorboard_writer.close()
+
     
 #!SECTION
 if __name__ == "__main__":
     import time
     time_start = time.time()
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
-    #run = wandb.init(project='test', mode='offline')
-    writer = SummaryWriter()
-    mp.spawn(test_trainer_function, nprocs=4)
+    
+    #writer.add_scalar("test", 0.5, 0)
+    #writer.close()
+    
+    mp.spawn(test_trainer_function, args=(), nprocs=4)
     time_elapsed = time.time() - time_start
+    
+    #writer.close()
     print(f"\ntime elapsed: {time_elapsed:.2f} seconds")
     
